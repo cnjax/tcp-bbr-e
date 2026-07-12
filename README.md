@@ -89,6 +89,49 @@ recovery re-flights, quick reprobes, warm starts, and a dump of the
 per-destination path cache. Module parameters `learning` and
 `warm_start` toggle the cache at runtime for A/B testing.
 
+## Benchmark results
+
+Measured with single-flow bulk transfers, comparing `bbr_e` against the
+stock in-kernel `bbr` on the same path within the same short time window
+(same-condition A/B — absolute throughput on a real internet path swings
+hour to hour, so only paired comparisons are meaningful). Loss was
+injected/removed with `tc netem`; shaping with a `tc` rate limit.
+
+**Clean path, ~120 Mbps capacity, near-zero baseline loss:**
+
+| Scenario | `bbr_e` | stock `bbr` |
+|---|---|---|
+| No loss (baseline) | 1.02x vs stock | — (parity, by design: no regression when there's nothing to classify) |
+| Recover after a 20%-loss window is removed | ~2–3s to full rate | ~12s |
+| 50 Mbit/s bottleneck (shaped) | 45.8 Mbps (~92% of link) | 41.7 Mbps (~83%), neither showed an RTO spiral |
+
+**Real long-haul path, ~200ms RTT, sustained real-world 10–20% random loss:**
+
+| Scenario | `bbr_e` | stock `bbr` |
+|---|---|---|
+| Recover after a loss window, zero RTO backoff for `bbr_e` | ~23s | did not recover within a 90s observation window (bandwidth collapsed to ~185 Kbps, cwnd in the single digits) |
+| 50 Mbit/s bottleneck (shaped) | 12.07 Mbps | 6.41 Mbps (1.88x), retransmit rates comparable (~26%) on both, neither RTO-spiraled |
+
+**Loss classification accuracy** (non-congestive : congestive round ratio
+on paths with sustained random loss and flat RTT): 58:1 to 79:1 —
+i.e. the classifier correctly attributes the large majority of loss
+rounds to the shallow non-congestive backoff instead of the full 30% cut.
+
+**Cross-connection warm start:** on a path whose cache has been seeded by
+one converged long-lived flow, subsequent short flows to the same
+destination start near the learned rate instead of ramping from zero —
+observed climbing e.g. 8.3 → 10.7 → 15.8 Mbps across successive short
+connections as the cache warms, and jumping immediately to ~75% of a
+previously-learned rate once seeded.
+
+**Known limitation:** on the most adverse observed condition (20%
+injected loss stacked on top of an already-lossy ~10–20% real path),
+absolute recovery time was ~23–35s (the stock-`bbr` control group simply
+never recovered in the same window). Recovery on a clean path reaches
+the ~2–3s range; closing that gap on doubly-lossy paths would need
+digging into stack-level RTO behavior, which is out of reach of a
+`congestion_ops` module (see Constraints).
+
 ## Constraints
 
 `struct bbr` is exactly 104 bytes — the stock kernel's
