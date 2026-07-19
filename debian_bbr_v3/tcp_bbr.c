@@ -97,6 +97,10 @@ module_param_named(warm_start_max_age_sec, bbr_warm_start_max_age_sec,
 		   uint, 0644);
 MODULE_PARM_DESC(warm_start_max_age_sec,
 		 "max age of a learned bw sample usable for warm start");
+static bool bbr_prior_bias __read_mostly = true;
+module_param_named(prior_bias, bbr_prior_bias, bool, 0644);
+MODULE_PARM_DESC(prior_bias,
+		 "let the validated per-path prior modulate loss response");
 
 /* Global counters (debugfs tcp_bbr_e/) so classification and warm-start
  * behavior on live traffic is observable without per-socket state.
@@ -106,6 +110,8 @@ static atomic_t bbr_stat_cong_rounds = ATOMIC_INIT(0);
 static atomic_t bbr_stat_reflights = ATOMIC_INIT(0);
 static atomic_t bbr_stat_warm_starts = ATOMIC_INIT(0);
 static atomic_t bbr_stat_quick_reprobes = ATOMIC_INIT(0);
+static atomic_t bbr_stat_reflight_validated = ATOMIC_INIT(0);
+static atomic_t bbr_stat_reflight_refuted = ATOMIC_INIT(0);
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
@@ -157,7 +163,11 @@ struct bbr {
 		probe_rtt_round_done:1,  /* a BBR_PROBE_RTT round at 4 pkts? */
 		init_cwnd:7,         /* initial cwnd */
 		loss_was_noncong:1,  /* last loss round judged non-congestive? */
-		unused_1:10;
+		reflight_pending:1,  /* re-flight awaiting outcome validation? */
+		reflight_rounds:2,   /* rounds since the re-flight, saturating */
+		path_base_loss:7;    /* cached path ambient loss (BBR_UNIT units,
+				      * capped 127) so the per-ACK loss_thresh
+				      * check needs no path-table lock */
 	u32	pacing_gain:11,	/* current gain for setting pacing rate */
 		cwnd_gain:11,	/* current gain for setting cwnd */
 		full_bw_reached:1,   /* reached full bw in Startup? */
@@ -406,6 +416,7 @@ static const bool bbr_fast_path = true;
 
 static u32 bbr_max_bw(const struct sock *sk);
 static u32 bbr_bw(const struct sock *sk);
+static u32 bbr_bdp(struct sock *sk, u32 bw, int gain);
 static void bbr_exit_probe_rtt(struct sock *sk);
 static void bbr_reset_congestion_signals(struct sock *sk);
 
@@ -462,10 +473,17 @@ struct bbr_path_entry {
 	struct hlist_node node;
 	struct in6_addr	daddr;		/* v4 stored as v4-mapped */
 	u32	bw;		/* learned max bw, pkts/uS << BW_SCALE */
+	u32	bw_avg;		/* running mean of per-round delivered bw:
+				 * what flows here actually sustain, ambient
+				 * loss and competing traffic included */
 	u32	min_rtt_us;	/* learned path min RTT */
 	u32	jitter_us;	/* EWMA RTT deviation in loss-free rounds */
 	u32	noncong;	/* EWMA share of loss rounds judged noncong,
 				 * in units of BBR_UNIT */
+	u32	reflight_ok;	/* re-flights whose delivery held up after */
+	u32	reflight_bad;	/* re-flights refuted by collapse/RTO after */
+	u32	base_loss;	/* learned ambient loss rate, BBR_UNIT units;
+				 * 0 = unknown (fall back to global caps) */
 	u32	flows;		/* completed flows that contributed */
 	u32	bw_stamp;	/* jiffies32 of last bw/min_rtt write-back */
 	u32	stamp;		/* jiffies32 of last touch (for eviction) */
@@ -515,9 +533,13 @@ static struct bbr_path_entry *__bbr_path_lookup(const struct in6_addr *key,
 		e = stale;	/* recycle the stalest entry in this bucket */
 		e->daddr = *key;
 		e->bw = 0;
+		e->bw_avg = 0;
 		e->min_rtt_us = 0;
 		e->jitter_us = 0;
 		e->noncong = 0;
+		e->reflight_ok = 0;
+		e->reflight_bad = 0;
+		e->base_loss = 0;
 		e->flows = 0;
 		e->bw_stamp = 0;
 		e->stamp = tcp_jiffies32;
@@ -572,6 +594,34 @@ static void bbr_path_note_clean_round(const struct sock *sk, u32 jitter_us)
 	spin_unlock_bh(&bbr_path_lock);
 }
 
+/* Fold one round's delivered bandwidth into the path's running mean. The
+ * full-bw plateau latch answers "has growth stopped?" and is defeated by
+ * recovery-batching spikes on fast-varying links; what warm start actually
+ * needs is "what do flows here sustain?". A dual-rate EWMA gives both fast
+ * acquisition and stable tracking: quarter-steps while the sample is more
+ * than 2x away from the mean (locks on within ~5-8 rounds after the ramp),
+ * sixteenth-steps inside the band (smooths steady-state oscillation).
+ */
+static void bbr_path_note_round_bw(const struct sock *sk, u32 bw)
+{
+	struct bbr_path_entry *e;
+	struct in6_addr key;
+
+	bbr_path_key(sk, &key);
+	spin_lock_bh(&bbr_path_lock);
+	e = __bbr_path_lookup(&key, bbr_path_hash(&key), true);
+	if (e) {
+		if (!e->bw_avg)
+			e->bw_avg = bw;
+		else if (bw > (e->bw_avg << 1) || bw < (e->bw_avg >> 1))
+			e->bw_avg += ((s32)(bw - e->bw_avg)) >> 2;
+		else
+			e->bw_avg += ((s32)(bw - e->bw_avg)) >> 4;
+		e->stamp = tcp_jiffies32;
+	}
+	spin_unlock_bh(&bbr_path_lock);
+}
+
 /* Record how a loss round was classified, as a slow EWMA. Not yet used to
  * bias classification; exposed via debugfs to characterize each path.
  */
@@ -591,6 +641,106 @@ static void bbr_path_note_loss_round(const struct sock *sk, bool noncong)
 	spin_unlock_bh(&bbr_path_lock);
 }
 
+/* Record whether a non-congestive verdict survived contact with reality:
+ * after a recovery-exit re-flight, did delivery hold near the learned bw
+ * (validated), or did the flow collapse into another loss episode / RTO
+ * (refuted)? Unlike the noncong EWMA above -- which records the classifier's
+ * own output and so cannot be fed back without a self-reinforcing loop --
+ * these outcome counters are the ground truth a later phase can safely use
+ * as a per-path prior. Phase 1: record only, no behavior change.
+ */
+static void bbr_note_reflight_outcome(struct sock *sk, bool ok)
+{
+	struct bbr_path_entry *e;
+	struct in6_addr key;
+
+	if (ok)
+		atomic_inc(&bbr_stat_reflight_validated);
+	else
+		atomic_inc(&bbr_stat_reflight_refuted);
+	if (!bbr_learning)
+		return;
+	bbr_path_key(sk, &key);
+	spin_lock_bh(&bbr_path_lock);
+	e = __bbr_path_lookup(&key, bbr_path_hash(&key), true);
+	if (e) {
+		if (ok)
+			e->reflight_ok = min_t(u32, e->reflight_ok + 1, 0xFFFF);
+		else
+			e->reflight_bad = min_t(u32, e->reflight_bad + 1, 0xFFFF);
+		e->stamp = tcp_jiffies32;
+	}
+	spin_unlock_bh(&bbr_path_lock);
+}
+
+/* The path's validated non-congestive prior, in BBR_UNIT units. Derived only
+ * from the outcome counters above (never from the classifier's own output, to
+ * avoid a self-reinforcing loop). A refuted re-flight weighs double: judging
+ * congestion "random" costs an RTO episode, judging random loss "congestion"
+ * only costs an over-cut. BBR_UNIT/2 is the neutral point at which every
+ * modulation below reduces exactly to the pre-prior behavior; returned when
+ * evidence is thin (<8 scored re-flights) or prior_bias is off.
+ */
+static u32 bbr_prior_from_entry(const struct bbr_path_entry *pe)
+{
+	u32 n = pe->reflight_ok + pe->reflight_bad;
+
+	if (!bbr_prior_bias || n < 8)
+		return BBR_UNIT / 2;
+	return div_u64((u64)pe->reflight_ok * BBR_UNIT,
+		       pe->reflight_ok + 2 * pe->reflight_bad);
+}
+
+/* Probe-stop loss threshold relative to the path's learned ambient loss
+ * rate. The global 10% constant was tuned for this deployment's 10-20%
+ * ambient-loss paths; the learned baseline gives a clean path back its
+ * stock-like probing prudence (fewer self-induced losses at real
+ * bottlenecks) instead of inheriting that tolerance. The learned value can
+ * only TIGHTEN below the global, never loosen past it, so self-induced loss
+ * polluting the baseline is bounded at exactly the pre-round-9 behavior.
+ * base_loss == 0 means unknown: use the global.
+ *
+ * Deliberately NOT applied to noncong_loss_cap: the classifier's density
+ * cap stays absolute at 25%, because a historically-clean path that
+ * suddenly shows RTT-flat 20% loss (wifi behind a wall -- the flagship
+ * scenario) must still classify non-congestive; RTT inflation, not loss
+ * rate vs history, is the congestion signal.
+ */
+static u32 bbr_loss_thresh_eff(u32 base_loss)
+{
+	if (!base_loss)
+		return bbr_loss_thresh;
+	return clamp_t(u32, base_loss + BBR_UNIT * 3 / 100,
+		       BBR_UNIT * 3 / 100, bbr_loss_thresh);
+}
+
+static u32 bbr_noncong_prior(struct sock *sk)
+{
+	struct bbr_path_entry pe;
+
+	if (!bbr_prior_bias || !bbr_learning || !bbr_path_peek(sk, &pe))
+		return BBR_UNIT / 2;
+	return bbr_prior_from_entry(&pe);
+}
+
+/* Effective backoff for a round judged non-congestive: the near-zero cut
+ * while the path's verdicts keep being validated, interpolated toward the
+ * full congestive beta as refuted re-flights drag the prior below neutral.
+ * A path where "non-congestive" verdicts keep ending in collapse/RTO pays
+ * progressively closer to the real price.
+ */
+static u32 bbr_noncong_beta_eff(struct sock *sk)
+{
+	u32 lo = bbr_param(sk, noncong_beta);
+	u32 hi = bbr_param(sk, beta);
+	u32 prior = bbr_noncong_prior(sk);
+
+	if (prior >= BBR_UNIT / 2)
+		return lo;
+	return lo + (u32)div_u64((u64)(hi - lo) * (BBR_UNIT / 2 - prior),
+				 BBR_UNIT / 2);
+}
+
 /* Write the flow's converged model back into the path cache. Called once per
  * PROBE_BW cycle for long flows and at socket release. The old bw decays
  * 12.5% per write-back unless re-confirmed, so a stale/unvalidated seed
@@ -606,11 +756,35 @@ static void bbr_path_flow_update(struct sock *sk, bool flow_done)
 
 	if (!bbr->initialized)
 		return;
+	/* Remember the sustained level, not the peak: the max-bw filter keeps
+	 * any single inflated sample (loss-recovery ACK batching spiked one
+	 * path's memory to 5x its real capacity), while full_bw is the plateau
+	 * estimate that a lone spike only pollutes transiently. Taking the min
+	 * means a spike must fool both filters at once to enter the cache.
+	 * full_bw can be 0 right after a reset (probe start, RTO); the max-bw
+	 * fallback there is safe because mid-flow writes only ratchet up and
+	 * the release path applies its generation decay regardless.
+	 */
 	bw = bbr_max_bw(sk);
+	if (bbr->full_bw)
+		bw = min(bw, bbr->full_bw);
 	if (!bw || !bbr->min_rtt_us || bbr->min_rtt_us == ~0U)
 		return;
-	if (!bbr_full_bw_reached(sk) || tp->delivered < 30)
-		return;	/* model never converged; nothing worth remembering */
+	/* Only flows with a real converged model may teach the cache -- short
+	 * unconverged flows write nothing (round-5 lesson). But on spiky
+	 * high-loss paths the full-bw plateau detector can be re-armed by
+	 * recovery ACK-batching spikes for tens of seconds, and if no flow
+	 * ever writes, bw_stamp goes stale and warm start dies until a lucky
+	 * flow converges (observed as a morning-long lockout). A flow that
+	 * has delivered thousands of packets at steady state is not "short
+	 * and unconverged" no matter what the plateau detector says, so it
+	 * qualifies too; the min(max_bw, full_bw) write value keeps its
+	 * contribution spike-resistant either way.
+	 */
+	if (tp->delivered < 30 ||
+	    (!bbr_full_bw_reached(sk) &&
+	     tp->delivered < max(4096U, 4 * bbr_bdp(sk, bw, BBR_UNIT))))
+		return;
 
 	bbr_path_key(sk, &key);
 	spin_lock_bh(&bbr_path_lock);
@@ -631,8 +805,32 @@ static void bbr_path_flow_update(struct sock *sk, bool flow_done)
 		else	/* track upward RTT drift slowly (route changes) */
 			e->min_rtt_us +=
 				(bbr->min_rtt_us - e->min_rtt_us) >> 2;
-		if (flow_done)
+		if (flow_done) {
+			u32 ratio;
+
 			e->flows = min_t(u32, e->flows + 1, 0xFFFF);
+			/* Age the outcome evidence one generation per
+			 * completed converged flow, so a path that changed
+			 * (bottleneck gone, route moved) can outgrow its old
+			 * prior instead of being penalized forever.
+			 */
+			e->reflight_ok -= e->reflight_ok >> 3;
+			e->reflight_bad -= e->reflight_bad >> 3;
+			/* Learn the ambient loss rate from the flow's
+			 * lifetime loss ratio. Seed directly on first write:
+			 * an EWMA climbing from zero would leave the derived
+			 * caps far too tight for a genuinely lossy path's
+			 * next few flows.
+			 */
+			ratio = max_t(u32, 1,
+				      div_u64((u64)tp->lost * BBR_UNIT,
+					      tp->delivered + tp->lost));
+			if (!e->base_loss)
+				e->base_loss = ratio;
+			else
+				e->base_loss +=
+					((s32)(ratio - e->base_loss)) >> 2;
+		}
 		e->bw_stamp = tcp_jiffies32;
 		e->stamp = tcp_jiffies32;
 	}
@@ -660,13 +858,16 @@ static int bbr_path_show(struct seq_file *m, void *v)
 	u32 now = tcp_jiffies32;
 	int bkt;
 
-	seq_puts(m, "daddr bw_mbps min_rtt_us jitter_us noncong_x256 flows bw_age_s touch_age_s\n");
+	seq_puts(m, "daddr bw_mbps bw_avg_mbps min_rtt_us jitter_us noncong_x256 base_loss_x256 reflight_ok reflight_bad flows bw_age_s touch_age_s\n");
 	spin_lock_bh(&bbr_path_lock);
 	hash_for_each(bbr_path_tbl, bkt, e, node) {
-		seq_printf(m, "%pI6c %llu %u %u %u %u %u %u\n",
+		seq_printf(m, "%pI6c %llu %llu %u %u %u %u %u %u %u %u %u\n",
 			   &e->daddr,
 			   ((u64)e->bw * 12000) >> BW_SCALE, /* ~1500B MSS */
-			   e->min_rtt_us, e->jitter_us, e->noncong, e->flows,
+			   ((u64)e->bw_avg * 12000) >> BW_SCALE,
+			   e->min_rtt_us, e->jitter_us, e->noncong,
+			   e->base_loss,
+			   e->reflight_ok, e->reflight_bad, e->flows,
 			   e->bw_stamp ? (now - e->bw_stamp) / HZ : 0,
 			   (now - e->stamp) / HZ);
 	}
@@ -1377,7 +1578,8 @@ static bool bbr_is_inflight_too_high(const struct sock *sk,
 	 */
 	if (rs->losses > 0 && rs->prior_in_flight) {
 		loss_thresh = (u64)rs->prior_in_flight *
-			      bbr_param(sk, loss_thresh) >> BBR_SCALE;
+			      bbr_loss_thresh_eff(bbr->path_base_loss)
+			      >> BBR_SCALE;
 		if (rs->losses > (s32)loss_thresh) {
 			return true;
 		}
@@ -1414,11 +1616,21 @@ static bool bbr_loss_is_noncongestive(struct sock *sk,
 	struct bbr *bbr = inet_csk_ca(sk);
 	struct bbr_path_entry pe;
 	u32 rtt_us, soft, hard, loss_cap;
+	bool have_pe = false;
 
 	if (bbr->min_rtt_us == ~0U)
 		return false;	/* no RTT baseline to compare against */
 	if (bbr->ecn_in_round || rs->delivered_ce > 0)
 		return false;	/* ECN marks indicate real congestion */
+	if (bbr_learning) {
+		have_pe = bbr_path_peek(sk, &pe);
+		/* Refresh the per-socket ambient-loss cache each loss round
+		 * (the peek is already paid for), keeping the per-ACK
+		 * loss_thresh check lock-free.
+		 */
+		if (have_pe)
+			bbr->path_base_loss = min_t(u32, pe.base_loss, 0x7F);
+	}
 	if (rs->losses > 0 && rs->prior_in_flight) {
 		loss_cap = (u64)rs->prior_in_flight *
 			   bbr_param(sk, noncong_loss_cap) >> BBR_SCALE;
@@ -1433,8 +1645,17 @@ static bool bbr_loss_is_noncongestive(struct sock *sk,
 	       bbr_param(sk, noncong_rtt_hard) >> BBR_SCALE;
 	soft = (u64)bbr->min_rtt_us *
 	       bbr_param(sk, noncong_rtt_thresh) >> BBR_SCALE;
-	if (bbr_learning && bbr_path_peek(sk, &pe) && pe.jitter_us)
-		soft = min(soft + 2 * pe.jitter_us, hard);
+	if (have_pe && pe.jitter_us) {
+		u32 prior = bbr_prior_from_entry(&pe);
+
+		/* Widen by 1x..3x the learned jitter, scaled by the validated
+		 * prior (2x at the neutral point): a path whose verdicts keep
+		 * being refuted earns less benefit of the doubt.
+		 */
+		soft = min(soft + (u32)((u64)pe.jitter_us *
+					(BBR_UNIT + 2 * prior) >> BBR_SCALE),
+			   hard);
+	}
 	return rtt_us <= soft;
 }
 
@@ -1589,7 +1810,7 @@ static void bbr_adapt_lower_bounds(struct sock *sk,
 	if (bbr->loss_in_round) {
 		bbr_init_lower_bounds(sk, true);
 		bbr_loss_lower_bounds(sk, &bbr->bw_lo, &bbr->inflight_lo,
-				      noncong ? bbr_param(sk, noncong_beta) :
+				      noncong ? bbr_noncong_beta_eff(sk) :
 						bbr_param(sk, beta));
 	}
 
@@ -1641,6 +1862,12 @@ static void bbr_exit_loss_recovery(struct sock *sk)
 						      bbr_param(sk, cwnd_gain))));
 		bbr_set_pacing_rate(sk, bbr_max_bw(sk), BBR_UNIT);
 		atomic_inc(&bbr_stat_reflights);
+		/* Arm outcome validation: over the next couple of round trips,
+		 * check whether delivery holds up near the learned bw
+		 * (verdict validated) or collapses (verdict refuted).
+		 */
+		bbr->reflight_pending = 1;
+		bbr->reflight_rounds = 0;
 	}
 	bbr->try_fast_path = 0; /* bound cwnd using latest model */
 }
@@ -1699,12 +1926,50 @@ static void bbr_update_congestion_signals(
 	if (!bbr->loss_round_start)
 		return;		/* skip the per-round-trip updates */
 	/* Now do per-round-trip updates. */
+	/* Re-flight outcome validation: two round trips after a noncong
+	 * re-flight, score the verdict by whether the last round's delivery
+	 * rate still ran near the learned max bw. App-limited rounds prove
+	 * nothing either way, so drop the validation rather than mis-score it.
+	 * (Entering TCP_CA_Loss scores it refuted, in bbr_set_state().)
+	 */
+	if (bbr->reflight_pending) {
+		if (rs->is_app_limited) {
+			bbr->reflight_pending = 0;
+		} else if (bbr->reflight_rounds < 2) {
+			bbr->reflight_rounds++;
+		} else {
+			bbr_note_reflight_outcome(sk,
+				bbr->bw_latest >= (bbr_max_bw(sk) >> 1));
+			bbr->reflight_pending = 0;
+		}
+	}
 	/* Loss-free round: learn this path's baseline RTT jitter
 	 * (tp->mdev_us is scaled by 4) for the loss classifier's soft gate.
 	 */
 	if (bbr_learning && !bbr->loss_in_round && !bbr->ecn_in_round &&
 	    tp->mdev_us)
 		bbr_path_note_clean_round(sk, tp->mdev_us >> 2);
+	/* Sample this round's delivered rate into the path's running mean
+	 * (app-limited rounds say nothing about the path). Use the round's
+	 * midpoint of the round's max sample and the round-boundary sample:
+	 * the boundary sample systematically underestimates (delayed-ACK
+	 * stretching; measured -20% vs steady on server1), the round max
+	 * systematically overestimates on spike-heavy lossy paths (recovery
+	 * ACK batching; measured +53% on server3) -- the two biases cancel
+	 * to first order. Skip the STARTUP ramp, whose
+	 * climbing rounds only dilute the mean -- unless the flow has already
+	 * moved several pipe-fulls, i.e. a stuck plateau detector is the only
+	 * reason we still look like STARTUP (round-12 lesson: any gate on a
+	 * detector needs a backstop for the detector itself failing).
+	 */
+	if (bbr_learning && !rs->is_app_limited && bbr->bw_latest &&
+	    (bbr->mode != BBR_STARTUP ||
+	     tp->delivered >=
+		max(4096U, 4 * bbr_bdp(sk, bbr_max_bw(sk), BBR_UNIT))))
+		bbr_path_note_round_bw(sk, ctx->sample_bw ?
+				       (bbr->bw_latest >> 1) +
+				       ((u32)ctx->sample_bw >> 1) :
+				       bbr->bw_latest);
 	bbr_adapt_lower_bounds(sk, rs);
 
 	bbr->loss_in_round = 0;
@@ -1855,7 +2120,7 @@ static void bbr_handle_inflight_too_high(struct sock *sk,
 	 */
 	noncong = bbr_loss_is_noncongestive(sk, rs);
 	if (noncong)
-		beta = bbr_param(sk, noncong_beta);
+		beta = bbr_noncong_beta_eff(sk);
 
 	bbr->prev_probe_too_high = 1;
 	bbr->bw_probe_samples = 0;  /* only react once per probe */
@@ -1882,8 +2147,13 @@ static void bbr_handle_inflight_too_high(struct sock *sk,
 		 * instead of slamming a broken pipe with RTT-scale probe
 		 * attempts -- each one dumps a fresh burst into heavy loss
 		 * and feeds the RTO/backoff spiral that outlives the episode.
+		 * A path whose noncong verdicts keep being refuted (prior
+		 * below 1/4) loses quick-reprobe privileges entirely; the
+		 * round-6 consecutive-failure gate stays absolute regardless
+		 * of how good the prior looks.
 		 */
-		if (noncong && !was_too_high) {
+		if (noncong && !was_too_high &&
+		    bbr_noncong_prior(sk) >= BBR_UNIT / 4) {
 			bbr->probe_wait_us =
 				min(bbr->probe_wait_us,
 				    bbr_param(sk, noncong_reprobe_rtts) *
@@ -2363,6 +2633,9 @@ __bpf_kfunc static void bbr_init(struct sock *sk)
 	bbr->loss_round_start = 0;
 	bbr->loss_events_in_round = 0;
 	bbr->loss_was_noncong = 0;
+	bbr->reflight_pending = 0;
+	bbr->reflight_rounds = 0;
+	bbr->path_base_loss = 0;
 	bbr->startup_ecn_rounds = 0;
 	bbr_reset_congestion_signals(sk);
 	bbr->bw_lo = ~0U;
@@ -2399,15 +2672,44 @@ __bpf_kfunc static void bbr_init(struct sock *sk)
 	if (bbr_learning && bbr_warm_start &&
 	    bbr->min_rtt_us && bbr->min_rtt_us != ~0U) {
 		struct bbr_path_entry pe;
+		u32 seed_bw = 0;
 
-		if (bbr_path_peek(sk, &pe) && pe.bw && pe.min_rtt_us &&
-		    pe.bw_stamp &&
-		    (u32)(tcp_jiffies32 - pe.bw_stamp) <
-				bbr_warm_start_max_age_sec * HZ &&
-		    bbr->min_rtt_us >= pe.min_rtt_us / 2 &&
-		    bbr->min_rtt_us <= pe.min_rtt_us * 4) {
-			u32 seed_bw = pe.bw - (pe.bw >> 2);
+		if (bbr_path_peek(sk, &pe)) {
+			bbr->path_base_loss = min_t(u32, pe.base_loss, 0x7F);
+			/* Prefer the running mean of recently delivered
+			 * rounds: it already reflects what flows to this
+			 * destination actually sustain -- ambient loss and
+			 * competing traffic included -- so it needs no
+			 * optimism discount. Fall back to the max/plateau
+			 * memory, discounted by the learned ambient loss
+			 * (that memory runs 2.5-4x optimistic on lossy
+			 * paths), when no mean has formed yet.
+			 */
+			if (pe.bw_avg &&
+			    (u32)(tcp_jiffies32 - pe.stamp) <
+					bbr_warm_start_max_age_sec * HZ) {
+				seed_bw = pe.bw_avg;
+			} else if (pe.bw && pe.bw_stamp &&
+				   (u32)(tcp_jiffies32 - pe.bw_stamp) <
+					bbr_warm_start_max_age_sec * HZ) {
+				u32 frac = clamp_t(u32,
+						   BBR_UNIT * 3 / 4 -
+						   2 * pe.base_loss,
+						   BBR_UNIT / 4,
+						   BBR_UNIT * 3 / 4);
 
+				seed_bw = (u64)pe.bw * frac >> BBR_SCALE;
+			}
+			/* Same-path sanity: handshake RTT must be consistent
+			 * with the learned min_rtt, else the address likely
+			 * moved and the memory is for another path.
+			 */
+			if (!pe.min_rtt_us ||
+			    bbr->min_rtt_us < pe.min_rtt_us / 2 ||
+			    bbr->min_rtt_us > pe.min_rtt_us * 4)
+				seed_bw = 0;
+		}
+		if (seed_bw) {
 			tcp_snd_cwnd_set(tp,
 				min(max(tcp_snd_cwnd(tp),
 					bbr_inflight(sk, seed_bw, BBR_UNIT)),
@@ -2479,6 +2781,15 @@ __bpf_kfunc static void bbr_set_state(struct sock *sk, u8 new_state)
 
 	if (new_state == TCP_CA_Loss) {
 
+		/* An RTO right after a non-congestive verdict (and/or while a
+		 * re-flight was still awaiting validation) is the strongest
+		 * evidence the verdict was wrong: score it refuted.
+		 */
+		if (bbr->prev_ca_state != TCP_CA_Loss &&
+		    (bbr->reflight_pending || bbr->loss_was_noncong)) {
+			bbr_note_reflight_outcome(sk, false);
+			bbr->reflight_pending = 0;
+		}
 		bbr->prev_ca_state = TCP_CA_Loss;
 		/* The tcp_write_timeout() call to sk_rethink_txhash() likely
 		 * repathed this flow, so re-learn the min network RTT on the
@@ -2571,6 +2882,10 @@ static int __init bbr_register(void)
 				&bbr_stat_warm_starts);
 	debugfs_create_atomic_t("quick_reprobes", 0444, bbr_debugfs_dir,
 				&bbr_stat_quick_reprobes);
+	debugfs_create_atomic_t("reflight_validated", 0444, bbr_debugfs_dir,
+				&bbr_stat_reflight_validated);
+	debugfs_create_atomic_t("reflight_refuted", 0444, bbr_debugfs_dir,
+				&bbr_stat_reflight_refuted);
 	debugfs_create_u32("path_entries", 0444, bbr_debugfs_dir,
 			   &bbr_path_entry_cnt);
 	debugfs_create_file("paths", 0444, bbr_debugfs_dir, NULL,
